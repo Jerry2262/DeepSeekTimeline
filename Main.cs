@@ -4,8 +4,10 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace DeepSeekTimeline
@@ -23,29 +25,29 @@ namespace DeepSeekTimeline
 
     static class NativeMethods
     {
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [DllImport("user32.dll")]
         public static extern bool SetProcessDPIAware();
 
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after,
             int x, int y, int cx, int cy, uint flags);
 
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
-        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        [StructLayout(LayoutKind.Sequential)]
         public struct RECT { public int L, T, R, B; }
 
-        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
 
-        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+        [DllImport("dwmapi.dll")]
         public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
 
-        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        [StructLayout(LayoutKind.Sequential)]
         public struct MARGINS { public int L, R, T, B; }
 
-        [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+        [DllImport("dwmapi.dll")]
         public static extern int DwmExtendFrameIntoClientArea(IntPtr hWnd, ref MARGINS m);
     }
 
@@ -67,7 +69,7 @@ namespace DeepSeekTimeline
 
         const int W = 520, H = 122;
         const int BandLeft = 20, BandTop = 52, BandRight = W - 20, BandBottom = 68;
-        const int WM_NCHITTEST = 0x84, HTCLIENT = 1, HTCAPTION = 2;
+        const int WM_NCHITTEST = 0x84, WM_NCLBUTTONDBLCLK = 0xA3, HTCLIENT = 1, HTCAPTION = 2;
         const int WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
         const int Peek = 5; // 吸附隐藏时顶部保留的提示条高度(px)
 
@@ -84,51 +86,47 @@ namespace DeepSeekTimeline
         static readonly Color Pointer   = Color.FromArgb(40, 40, 46);
 
         readonly bool[] peakHour = new bool[24];
-        readonly Font fontBig, fontMid, fontSub, fontTick;
-        readonly Timer timer;
-        readonly Timer dockTimer;
+        readonly Font fontBig, fontSub, fontTick;
+        readonly Timer timer, dockTimer;
         readonly Rectangle closeRect = new Rectangle(W - 24, 8, 14, 14);
-        bool hoverClose;
-        bool docked, expanded, dragging;
-        int lastHover;
+        bool hoverClose, docked, expanded, dragging;
         Rectangle monRect;
 
         // ---- 性能缓存: 所有颜色/几何均静态, GDI 对象只创建一次, 复用至进程结束 ----
-        static readonly int[] TransHours = new int[] { 9, 12, 14, 18 };
-        static readonly SolidBrush BrPeak, BrOff, BrDim, BrMain, BrSub, BrFaint,
-            BrAccent, BrAccentOff, BrDot;
-        static readonly Pen PenPointer, PenBorder, PenCloseDim, PenCloseHot;
-        static readonly GraphicsPath BandPath;
-        static readonly Dictionary<string, float> MeasureCache =
-            new Dictionary<string, float>();
-
-        static TimelineForm()
-        {
-            BrPeak = new SolidBrush(PeakColor);
-            BrOff = new SolidBrush(OffColor);
-            BrDim = new SolidBrush(Color.FromArgb(165, 247, 247, 248));
-            BrMain = new SolidBrush(TextMain);
-            BrSub = new SolidBrush(TextSub);
-            BrFaint = new SolidBrush(TextFaint);
-            BrAccent = new SolidBrush(Accent);
-            BrAccentOff = new SolidBrush(AccentOff);
+        // TransHours 由 PeakRanges 派生并排序, 官方调时段后无需同步第二处
+        static readonly int[] TransHours = BuildTransHours();
+        static readonly SolidBrush
+            BrPeak = new SolidBrush(PeakColor),
+            BrOff = new SolidBrush(OffColor),
+            BrDim = new SolidBrush(Color.FromArgb(165, 247, 247, 248)),
+            BrMain = new SolidBrush(TextMain),
+            BrSub = new SolidBrush(TextSub),
+            BrFaint = new SolidBrush(TextFaint),
+            BrAccent = new SolidBrush(Accent),
+            BrAccentOff = new SolidBrush(AccentOff),
             BrDot = new SolidBrush(Pointer);
-            PenPointer = new Pen(Pointer, 1.4f);
-            PenBorder = new Pen(Border);
-            PenCloseDim = new Pen(Color.FromArgb(165, 167, 173), 1.6f);
+        static readonly Pen
+            PenPointer = new Pen(Pointer, 1.4f),
+            PenBorder = new Pen(Border),
+            PenCloseDim = new Pen(Color.FromArgb(165, 167, 173), 1.6f),
             PenCloseHot = new Pen(Color.FromArgb(200, 90, 80), 1.6f);
-            BandPath = RoundedRect(new RectangleF(BandLeft, BandTop,
-                BandRight - BandLeft, BandBottom - BandTop), 5f);
+        static readonly GraphicsPath BandPath = RoundedRect(new RectangleF(BandLeft,
+            BandTop, BandRight - BandLeft, BandBottom - BandTop), 5f);
+
+        static int[] BuildTransHours()
+        {
+            List<int> ts = new List<int>();
+            foreach (int[] r in PeakRanges) { ts.Add(r[0]); ts.Add(r[1]); }
+            ts.Sort();
+            return ts.ToArray();
         }
 
         public TimelineForm()
         {
-            for (int h = 0; h < 24; h++) peakHour[h] = false;
             foreach (int[] r in PeakRanges)
                 for (int h = r[0]; h < r[1]; h++) peakHour[h] = true;
 
             fontBig  = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
-            fontMid  = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
             fontSub  = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
             fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
 
@@ -145,13 +143,15 @@ namespace DeepSeekTimeline
             if (!LoadPosition()) Location = DefaultPosition();
 
             timer = new Timer();
-            timer.Interval = 5000; // 可见时 5s 刷新; 收起期间由展开动作即时触发
+            // 分钟对齐重绘: 画面均为分钟粒度, 倒计时误差 <1s
             timer.Tick += delegate
             {
+                SyncTimerToMinute();
                 // 完全收起时可见区只有 5px 静态边条, 跳过无效重绘
                 if (docked && !expanded && Top <= monRect.Top - H + Peek) return;
                 Invalidate();
             };
+            SyncTimerToMinute();
             timer.Start();
 
             dockTimer = new Timer();
@@ -186,25 +186,17 @@ namespace DeepSeekTimeline
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            try
-            {
-                int round = 2;
-                NativeMethods.DwmSetWindowAttribute(Handle, 33, ref round, 4);
-                NativeMethods.MARGINS mg = new NativeMethods.MARGINS();
-                mg.L = 1; mg.R = 1; mg.T = 1; mg.B = 1;
-                NativeMethods.DwmExtendFrameIntoClientArea(Handle, ref mg);
-            }
-            catch { }
+            int round = 2;
+            NativeMethods.DwmSetWindowAttribute(Handle, 33, ref round, 4);
+            NativeMethods.MARGINS mg = new NativeMethods.MARGINS { L = 1, R = 1, T = 1, B = 1 };
+            NativeMethods.DwmExtendFrameIntoClientArea(Handle, ref mg);
         }
 
-        static DateTime BeijingNow()
+        // 距下一整分钟 +0.1s 过冲
+        void SyncTimerToMinute()
         {
-            try
-            {
-                return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow,
-                    TimeZoneInfo.FindSystemTimeZoneById("China Standard Time"));
-            }
-            catch { return DateTime.Now; }
+            DateTime n = DateTime.Now;
+            timer.Interval = 60100 - (n.Second * 1000 + n.Millisecond);
         }
 
         DateTime NextTransition(DateTime now, out bool toPeak)
@@ -215,8 +207,8 @@ namespace DeepSeekTimeline
                 if (t > now) { toPeak = peakHour[hh]; return t; }
             }
             DateTime d = now.Date.AddDays(1);
-            toPeak = true;
-            return new DateTime(d.Year, d.Month, d.Day, 9, 0, 0);
+            toPeak = peakHour[TransHours[0]];
+            return new DateTime(d.Year, d.Month, d.Day, TransHours[0], 0, 0);
         }
 
         Point DefaultPosition()
@@ -288,11 +280,15 @@ namespace DeepSeekTimeline
                     docked = true;                              // 拖到顶 = 吸附
                     expanded = true;
                     Invalidate();
-                    lastHover = Environment.TickCount;
                     dockTimer.Start();
                 }
                 SavePosition();
                 base.WndProc(ref m);
+                return;
+            }
+            if (m.Msg == WM_NCLBUTTONDBLCLK) // 吞掉标题栏双击, 防止系统最大化全屏
+            {
+                m.Result = IntPtr.Zero;
                 return;
             }
             if (m.Msg == WM_NCHITTEST)
@@ -339,26 +335,16 @@ namespace DeepSeekTimeline
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
-            timer.Stop();
-            dockTimer.Stop();
-            fontBig.Dispose(); fontMid.Dispose(); fontSub.Dispose(); fontTick.Dispose();
-            BrPeak.Dispose(); BrOff.Dispose(); BrDim.Dispose(); BrMain.Dispose();
-            BrSub.Dispose(); BrFaint.Dispose(); BrAccent.Dispose(); BrAccentOff.Dispose();
-            BrDot.Dispose(); PenPointer.Dispose(); PenBorder.Dispose();
-            PenCloseDim.Dispose(); PenCloseHot.Dispose(); BandPath.Dispose();
+            foreach (IDisposable d in new IDisposable[] { timer, dockTimer,
+                fontBig, fontSub, fontTick, BrPeak, BrOff, BrDim, BrMain, BrSub,
+                BrFaint, BrAccent, BrAccentOff, BrDot, PenPointer, PenBorder,
+                PenCloseDim, PenCloseHot, BandPath }) d.Dispose();
             base.OnFormClosed(e);
         }
 
-        // 文本宽度缓存: 绝大多数文字在帧间重复, 命中后零测量开销
-        float Wd(Graphics g, string s, Font f)
+        static float Wd(Graphics g, string s, Font f)
         {
-            float w;
-            if (!MeasureCache.TryGetValue(s, out w))
-            {
-                w = g.MeasureString(s, f).Width;
-                MeasureCache[s] = w;
-            }
-            return w;
+            return g.MeasureString(s, f).Width;
         }
 
         // 吸附模式核心: 鼠标感应 + 缓出滑动动画
@@ -366,7 +352,7 @@ namespace DeepSeekTimeline
         {
             if (!docked || dragging) return;
             Point mp = Cursor.Position;
-            Rectangle wr = new Rectangle(Location, Size);
+            Rectangle wr = Bounds;
             bool nearTop = mp.X >= wr.Left - 80 && mp.X <= wr.Right + 80
                         && mp.Y >= monRect.Top - 4 && mp.Y <= monRect.Top + 6;
             bool inside = mp.X >= wr.Left - 20 && mp.X <= wr.Right + 20
@@ -378,7 +364,6 @@ namespace DeepSeekTimeline
                     expanded = true;
                     Invalidate(); // 展开瞬间立即按最新时间重绘, 杜绝旧数据
                 }
-                lastHover = Environment.TickCount;
             }
             else if (expanded)
             {
@@ -426,10 +411,10 @@ namespace DeepSeekTimeline
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAlias;
             g.Clear(Bg);
 
-            DateTime now = BeijingNow();
+            DateTime now = DateTime.Now;
             bool peak = peakHour[now.Hour];
             int idx = peak ? 1 : 0;
             float bandW = BandRight - BandLeft;
@@ -440,7 +425,7 @@ namespace DeepSeekTimeline
             string s2 = peak ? "全价" : "5 折";
             g.FillEllipse(peak ? BrAccent : BrAccentOff, 22, 21, 9, 9);
             g.DrawString(s1, fontBig, BrMain, 40, 13);
-            g.DrawString(s2, fontMid, BrSub, 40 + Wd(g, s1, fontBig) + 6, 19);
+            g.DrawString(s2, fontSub, BrSub, 40 + Wd(g, s1, fontBig) + 6, 19);
 
             // 右侧倒计时: 数字右对齐, 标签再向左排
             bool toPeak;
@@ -450,7 +435,7 @@ namespace DeepSeekTimeline
             string cl = string.Format("距转入{0}", toPeak ? "峰" : "谷");
             float vx = W - 36 - Wd(g, cv, fontBig);
             g.DrawString(cv, fontBig, BrMain, vx, 13);
-            g.DrawString(cl, fontMid, BrSub, vx - 8 - Wd(g, cl, fontMid), 19);
+            g.DrawString(cl, fontSub, BrSub, vx - 8 - Wd(g, cl, fontSub), 19);
 
             // ---- 色带 (已流逝时段蒙白, 边界精确到当前时刻与指针对齐) ----
             float xNow = BandLeft + bandW * (float)(cur / 24.0);
