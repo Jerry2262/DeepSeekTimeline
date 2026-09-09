@@ -54,17 +54,21 @@ namespace DeepSeekTimeline
     class TimelineForm : Form
     {
         // ============ 配置区: 官方调价 / 调时段后只需改这里 ============
-        // 峰时时段 [起,止) 北京时间, 其余为谷时
+        // 峰时时段 [起,止) 北京时间, 仅工作日; 周末全天谷时 (官方 2026-08-23 起)
         static readonly int[][] PeakRanges = new int[][]
         {
             new int[] { 9, 12 },
             new int[] { 14, 18 }
         };
         // 百万 tokens 单价(元) [0]=谷 [1]=峰
-        static readonly decimal[] PriceFlashIn  = new decimal[] { 1.5m, 3.0m };
-        static readonly decimal[] PriceFlashOut = new decimal[] { 4.5m, 9.0m };
         static readonly decimal[] PriceProIn    = new decimal[] { 4.5m, 9.0m };
         static readonly decimal[] PriceProOut   = new decimal[] { 13.5m, 27.0m };
+        // Flash: 2026-09-10 12:00 (北京时间) 起执行新价; 之后可删掉两组旧价与 PriceSwitch
+        static readonly DateTime PriceSwitch       = new DateTime(2026, 9, 10, 12, 0, 0);
+        static readonly decimal[] PriceFlashInOld  = new decimal[] { 1.5m, 3.0m };
+        static readonly decimal[] PriceFlashOutOld = new decimal[] { 4.5m, 9.0m };
+        static readonly decimal[] PriceFlashIn     = new decimal[] { 1.0m, 2.0m };
+        static readonly decimal[] PriceFlashOut    = new decimal[] { 4.0m, 8.0m };
         // ==============================================================
 
         const int W = 520, H = 122;
@@ -160,13 +164,13 @@ namespace DeepSeekTimeline
             // 仅吸附状态才需要轮询鼠标, 未吸附时保持停止 (见 WndProc/OnLoad)
         }
 
-        // 不抢焦点 + 不出现在 Alt-Tab (悬浮组件的标准样式)
+        // 不出现在 Alt-Tab；保留正常的置顶窗口激活行为
         protected override CreateParams CreateParams
         {
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= 0x08000000 | 0x00000080; // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+                cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
                 return cp;
             }
         }
@@ -199,16 +203,33 @@ namespace DeepSeekTimeline
             timer.Interval = 60100 - (n.Second * 1000 + n.Millisecond);
         }
 
+        // 周末全天谷时, 工作日按 PeakRanges
+        bool IsPeak(DateTime t)
+        {
+            DayOfWeek d = t.DayOfWeek;
+            return d != DayOfWeek.Saturday && d != DayOfWeek.Sunday && peakHour[t.Hour];
+        }
+
+        // Flash 单价组: 新价生效时刻前后各用一组
+        static decimal[] FlashIn(DateTime now)
+        {
+            return now >= PriceSwitch ? PriceFlashIn : PriceFlashInOld;
+        }
+
+        static decimal[] FlashOut(DateTime now)
+        {
+            return now >= PriceSwitch ? PriceFlashOut : PriceFlashOutOld;
+        }
+
+        // 逐整点向后扫描, 返回第一个峰谷状态翻转的时刻 (跨天/周末均适用)
         DateTime NextTransition(DateTime now, out bool toPeak)
         {
-            foreach (int hh in TransHours)
-            {
-                DateTime t = new DateTime(now.Year, now.Month, now.Day, hh, 0, 0);
-                if (t > now) { toPeak = peakHour[hh]; return t; }
-            }
-            DateTime d = now.Date.AddDays(1);
-            toPeak = peakHour[TransHours[0]];
-            return new DateTime(d.Year, d.Month, d.Day, TransHours[0], 0, 0);
+            bool cur = IsPeak(now);
+            DateTime t = now.Date.AddHours(now.Hour + 1); // 下一整点
+            for (int i = 0; i < 8 * 24; i++, t = t.AddHours(1))
+                if (IsPeak(t) != cur) { toPeak = !cur; return t; }
+            toPeak = !cur;
+            return t; // 8 天内必有翻转, 不会执行到这
         }
 
         Point DefaultPosition()
@@ -415,7 +436,9 @@ namespace DeepSeekTimeline
             g.Clear(Bg);
 
             DateTime now = DateTime.Now;
-            bool peak = peakHour[now.Hour];
+            bool peak = IsPeak(now);
+            bool weekend = now.DayOfWeek == DayOfWeek.Saturday
+                        || now.DayOfWeek == DayOfWeek.Sunday;
             int idx = peak ? 1 : 0;
             float bandW = BandRight - BandLeft;
             double cur = now.Hour + now.Minute / 60.0 + now.Second / 3600.0;
@@ -444,18 +467,21 @@ namespace DeepSeekTimeline
             {
                 float x1 = BandLeft + bandW * h / 24f;
                 float x2 = BandLeft + bandW * (h + 1) / 24f;
-                g.FillRectangle(peakHour[h] ? BrPeak : BrOff,
+                g.FillRectangle(!weekend && peakHour[h] ? BrPeak : BrOff,
                     x1, BandTop, x2 - x1 + 1f, BandBottom - BandTop);
             }
             g.FillRectangle(BrDim, BandLeft, BandTop, xNow - BandLeft, BandBottom - BandTop);
             g.ResetClip();
 
-            // ---- 关键节点标注: 仅峰谷转换时刻 ----
-            foreach (int hh in TransHours)
+            // ---- 关键节点标注: 仅峰谷转换时刻 (周末全天谷时不标注) ----
+            if (!weekend)
             {
-                float x = BandLeft + bandW * hh / 24f;
-                string t = hh.ToString(CultureInfo.InvariantCulture);
-                g.DrawString(t, fontTick, BrFaint, x - Wd(g, t, fontTick) / 2f, BandBottom + 4f);
+                foreach (int hh in TransHours)
+                {
+                    float x = BandLeft + bandW * hh / 24f;
+                    string t = hh.ToString(CultureInfo.InvariantCulture);
+                    g.DrawString(t, fontTick, BrFaint, x - Wd(g, t, fontTick) / 2f, BandBottom + 4f);
+                }
             }
 
             // ---- 当前时刻指针 (深色细线 + 圆点) ----
@@ -465,7 +491,7 @@ namespace DeepSeekTimeline
             // ---- 价格行: Flash(左) / Pro(右) ----
             float by = 96;
             string fl = string.Format(CultureInfo.InvariantCulture,
-                "Flash 入 {0} · 出 {1}", Fmt(PriceFlashIn[idx]), Fmt(PriceFlashOut[idx]));
+                "Flash 入 {0} · 出 {1}", Fmt(FlashIn(now)[idx]), Fmt(FlashOut(now)[idx]));
             string pr = string.Format(CultureInfo.InvariantCulture,
                 "Pro 入 {0} · 出 {1}", Fmt(PriceProIn[idx]), Fmt(PriceProOut[idx]));
             g.DrawString(fl, fontSub, BrSub, 20, by);
