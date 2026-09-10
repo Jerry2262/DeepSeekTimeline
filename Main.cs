@@ -60,14 +60,18 @@ namespace DeepSeekTimeline
             new int[] { 9, 12 },
             new int[] { 14, 18 }
         };
-        // 百万 tokens 单价(元) [0]=谷 [1]=峰
-        static readonly decimal[] PriceProIn    = new decimal[] { 4.5m, 9.0m };
-        static readonly decimal[] PriceProOut   = new decimal[] { 13.5m, 27.0m };
-        // Flash: 2026-09-10 12:00 (北京时间) 起执行新价; 之后可删掉两组旧价与 PriceSwitch
+        // 百万 tokens 单价(元) [0]=谷 [1]=峰; Hit=输入(缓存命中), In=输入(缓存未命中)
+        // Pro: 价格行放不下两个模型, 暂不显示; 需要时取消注释并在价格行恢复 Pro 串
+        //static readonly decimal[] PriceProIn  = new decimal[] { 4.5m, 9.0m };
+        //static readonly decimal[] PriceProHit = new decimal[] { 0.15m, 0.30m };
+        //static readonly decimal[] PriceProOut = new decimal[] { 13.5m, 27.0m };
+        // Flash: 2026-09-10 12:00 (北京时间) 起执行新价; 之后可删掉三组旧价与 PriceSwitch
         static readonly DateTime PriceSwitch       = new DateTime(2026, 9, 10, 12, 0, 0);
         static readonly decimal[] PriceFlashInOld  = new decimal[] { 1.5m, 3.0m };
+        static readonly decimal[] PriceFlashHitOld = new decimal[] { 0.05m, 0.10m };
         static readonly decimal[] PriceFlashOutOld = new decimal[] { 4.5m, 9.0m };
         static readonly decimal[] PriceFlashIn     = new decimal[] { 1.0m, 2.0m };
+        static readonly decimal[] PriceFlashHit    = new decimal[] { 0.02m, 0.04m };
         static readonly decimal[] PriceFlashOut    = new decimal[] { 4.0m, 8.0m };
         // ==============================================================
 
@@ -214,6 +218,11 @@ namespace DeepSeekTimeline
         static decimal[] FlashIn(DateTime now)
         {
             return now >= PriceSwitch ? PriceFlashIn : PriceFlashInOld;
+        }
+
+        static decimal[] FlashHit(DateTime now)
+        {
+            return now >= PriceSwitch ? PriceFlashHit : PriceFlashHitOld;
         }
 
         static decimal[] FlashOut(DateTime now)
@@ -488,14 +497,11 @@ namespace DeepSeekTimeline
             g.DrawLine(PenPointer, xNow, BandTop - 3f, xNow, BandBottom + 3f);
             g.FillEllipse(BrDot, xNow - 3f, BandTop - 10f, 6f, 6f);
 
-            // ---- 价格行: Flash(左) / Pro(右) ----
-            float by = 96;
+            // ---- 价格行: 仅 Flash ----
             string fl = string.Format(CultureInfo.InvariantCulture,
-                "Flash 入 {0} · 出 {1}", Fmt(FlashIn(now)[idx]), Fmt(FlashOut(now)[idx]));
-            string pr = string.Format(CultureInfo.InvariantCulture,
-                "Pro 入 {0} · 出 {1}", Fmt(PriceProIn[idx]), Fmt(PriceProOut[idx]));
-            g.DrawString(fl, fontSub, BrSub, 20, by);
-            g.DrawString(pr, fontSub, BrSub, W - 20 - Wd(g, pr, fontSub), by);
+                "Flash 入 {0} · 缓存 {1} · 出 {2}",
+                Fmt(FlashIn(now)[idx]), Fmt(FlashHit(now)[idx]), Fmt(FlashOut(now)[idx]));
+            g.DrawString(fl, fontSub, BrSub, 20, 96);
 
             // ---- 关闭按钮 ----
             Pen cp = hoverClose ? PenCloseHot : PenCloseDim;
