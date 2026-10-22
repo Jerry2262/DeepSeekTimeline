@@ -33,6 +33,9 @@ namespace DeepSeekTimeline
             int x, int y, int cx, int cy, uint flags);
 
         [DllImport("user32.dll")]
+        public static extern int GetWindowLong(IntPtr hWnd, int index);
+
+        [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
         [StructLayout(LayoutKind.Sequential)]
@@ -54,31 +57,43 @@ namespace DeepSeekTimeline
     class TimelineForm : Form
     {
         // ============ 配置区: 官方调价 / 调时段后只需改这里 ============
-        // 峰时时段 [起,止) 北京时间, 仅工作日; 周末全天谷时 (官方 2026-08-23 起)
+        // 峰时时段 [起,止) 北京时间, 仅工作日; 周末与法定节假日全天谷时, 调休上班的周末同样按谷时
+        // (官方 2026-09-19 规则: 工作日 9-12/14-18 为峰, 其余全谷)
         static readonly int[][] PeakRanges = new int[][]
         {
             new int[] { 9, 12 },
             new int[] { 14, 18 }
         };
+        // 法定节假日落在工作日的那几天(yyyyMMdd), 全天按谷时计费; 节假日中的周末与
+        // 调休上班的周末无需列出(本就全天谷)。国务院每年 11 月前后公布次年安排, 届时在此补数据。
+        // 2026 依据: 国办发明电〔2025〕7号
+        static readonly int[] Holidays =
+        {
+            20260101, 20260102,                                          // 元旦
+            20260216, 20260217, 20260218, 20260219, 20260220, 20260223,  // 春节
+            20260406,                                                    // 清明
+            20260501, 20260504, 20260505,                                // 劳动节
+            20260619,                                                    // 端午
+            20260925,                                                    // 中秋
+            20261001, 20261002, 20261005, 20261006, 20261007             // 国庆
+        };
         // 百万 tokens 单价(元) [0]=谷 [1]=峰; Hit=输入(缓存命中), In=输入(缓存未命中)
-        // Pro: 价格行放不下两个模型, 暂不显示; 需要时取消注释并在价格行恢复 Pro 串
-        //static readonly decimal[] PriceProIn  = new decimal[] { 4.5m, 9.0m };
-        //static readonly decimal[] PriceProHit = new decimal[] { 0.15m, 0.30m };
-        //static readonly decimal[] PriceProOut = new decimal[] { 13.5m, 27.0m };
-        // Flash: 2026-09-10 12:00 (北京时间) 起执行新价; 之后可删掉三组旧价与 PriceSwitch
-        static readonly DateTime PriceSwitch       = new DateTime(2026, 9, 10, 12, 0, 0);
-        static readonly decimal[] PriceFlashInOld  = new decimal[] { 1.5m, 3.0m };
-        static readonly decimal[] PriceFlashHitOld = new decimal[] { 0.05m, 0.10m };
-        static readonly decimal[] PriceFlashOutOld = new decimal[] { 4.5m, 9.0m };
-        static readonly decimal[] PriceFlashIn     = new decimal[] { 1.0m, 2.0m };
-        static readonly decimal[] PriceFlashHit    = new decimal[] { 0.02m, 0.04m };
-        static readonly decimal[] PriceFlashOut    = new decimal[] { 4.0m, 8.0m };
+        // Flash = DeepSeek-V4.1-Flash-1017(模型名 deepseek-flash), Pro = DeepSeek-V4-Pro-0813
+        // 2026-10 与官方定价页核对一致; 官方调价后直接改数字
+        static readonly decimal[] PriceFlashIn  = new decimal[] { 1.0m, 2.0m };
+        static readonly decimal[] PriceFlashHit = new decimal[] { 0.02m, 0.04m };
+        static readonly decimal[] PriceFlashOut = new decimal[] { 4.0m, 8.0m };
+        static readonly decimal[] PriceProIn    = new decimal[] { 4.5m, 9.0m };
+        static readonly decimal[] PriceProHit   = new decimal[] { 0.15m, 0.30m };
+        static readonly decimal[] PriceProOut   = new decimal[] { 13.5m, 27.0m };
         // ==============================================================
 
         const int W = 520, H = 122;
         const int BandLeft = 20, BandTop = 52, BandRight = W - 20, BandBottom = 68;
         const int WM_NCHITTEST = 0x84, WM_NCLBUTTONDBLCLK = 0xA3, HTCLIENT = 1, HTCAPTION = 2;
         const int WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
+        const int WM_WINDOWPOSCHANGED = 0x47, WM_STYLECHANGED = 0x7D;
+        const int GWL_EXSTYLE = -20, WS_EX_TOPMOST = 0x00000008;
         const int Peek = 5; // 吸附隐藏时顶部保留的提示条高度(px)
 
         // 淡色系
@@ -94,7 +109,7 @@ namespace DeepSeekTimeline
         static readonly Color Pointer   = Color.FromArgb(40, 40, 46);
 
         readonly bool[] peakHour = new bool[24];
-        readonly Font fontBig, fontSub, fontTick;
+        readonly Font fontBig, fontSub, fontTick, fontPrice;
         readonly Timer timer, dockTimer;
         readonly Rectangle closeRect = new Rectangle(W - 24, 8, 14, 14);
         bool hoverClose, docked, expanded, dragging;
@@ -137,6 +152,7 @@ namespace DeepSeekTimeline
             fontBig  = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
             fontSub  = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
             fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
+            fontPrice = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular);
 
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
@@ -207,27 +223,17 @@ namespace DeepSeekTimeline
             timer.Interval = 60100 - (n.Second * 1000 + n.Millisecond);
         }
 
-        // 周末全天谷时, 工作日按 PeakRanges
+        // 非工作日(周末/法定节假日)全天谷时, 工作日按 PeakRanges; 调休上班的周末官方同样按谷时
         bool IsPeak(DateTime t)
         {
             DayOfWeek d = t.DayOfWeek;
-            return d != DayOfWeek.Saturday && d != DayOfWeek.Sunday && peakHour[t.Hour];
+            if (d == DayOfWeek.Saturday || d == DayOfWeek.Sunday || IsHoliday(t)) return false;
+            return peakHour[t.Hour];
         }
 
-        // Flash 单价组: 新价生效时刻前后各用一组
-        static decimal[] FlashIn(DateTime now)
+        static bool IsHoliday(DateTime t)
         {
-            return now >= PriceSwitch ? PriceFlashIn : PriceFlashInOld;
-        }
-
-        static decimal[] FlashHit(DateTime now)
-        {
-            return now >= PriceSwitch ? PriceFlashHit : PriceFlashHitOld;
-        }
-
-        static decimal[] FlashOut(DateTime now)
-        {
-            return now >= PriceSwitch ? PriceFlashOut : PriceFlashOutOld;
+            return Array.IndexOf(Holidays, t.Year * 10000 + t.Month * 100 + t.Day) >= 0;
         }
 
         // 逐整点向后扫描, 返回第一个峰谷状态翻转的时刻 (跨天/周末均适用)
@@ -288,8 +294,25 @@ namespace DeepSeekTimeline
             catch { }
         }
 
+        // TopMost 是 WinForms 的期望状态, 原生窗口被降级后它仍可能为 true。
+        // 只在收到层级/样式变更通知后修复缺失的标志, 不轮询、不反复抢占其他置顶窗口。
+        void EnsureTopMost()
+        {
+            if (!IsHandleCreated || IsDisposed || !TopMost) return;
+            if ((NativeMethods.GetWindowLong(Handle, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) return;
+            NativeMethods.SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0,
+                0x0001 | 0x0002 | 0x0010); // HWND_TOPMOST; NOSIZE | NOMOVE | NOACTIVATE
+        }
+
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == WM_WINDOWPOSCHANGED
+                || (m.Msg == WM_STYLECHANGED && m.WParam.ToInt64() == GWL_EXSTYLE))
+            {
+                base.WndProc(ref m);
+                EnsureTopMost();
+                return;
+            }
             if (m.Msg == WM_ENTERSIZEMOVE)
             {
                 dragging = true;
@@ -366,7 +389,7 @@ namespace DeepSeekTimeline
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             foreach (IDisposable d in new IDisposable[] { timer, dockTimer,
-                fontBig, fontSub, fontTick, BrPeak, BrOff, BrDim, BrMain, BrSub,
+                fontBig, fontSub, fontTick, fontPrice, BrPeak, BrOff, BrDim, BrMain, BrSub,
                 BrFaint, BrAccent, BrAccentOff, BrDot, PenPointer, PenBorder,
                 PenCloseDim, PenCloseHot, BandPath }) d.Dispose();
             base.OnFormClosed(e);
@@ -446,8 +469,8 @@ namespace DeepSeekTimeline
 
             DateTime now = DateTime.Now;
             bool peak = IsPeak(now);
-            bool weekend = now.DayOfWeek == DayOfWeek.Saturday
-                        || now.DayOfWeek == DayOfWeek.Sunday;
+            bool offDay = now.DayOfWeek == DayOfWeek.Saturday
+                        || now.DayOfWeek == DayOfWeek.Sunday || IsHoliday(now);
             int idx = peak ? 1 : 0;
             float bandW = BandRight - BandLeft;
             double cur = now.Hour + now.Minute / 60.0 + now.Second / 3600.0;
@@ -476,14 +499,14 @@ namespace DeepSeekTimeline
             {
                 float x1 = BandLeft + bandW * h / 24f;
                 float x2 = BandLeft + bandW * (h + 1) / 24f;
-                g.FillRectangle(!weekend && peakHour[h] ? BrPeak : BrOff,
+                g.FillRectangle(!offDay && peakHour[h] ? BrPeak : BrOff,
                     x1, BandTop, x2 - x1 + 1f, BandBottom - BandTop);
             }
             g.FillRectangle(BrDim, BandLeft, BandTop, xNow - BandLeft, BandBottom - BandTop);
             g.ResetClip();
 
-            // ---- 关键节点标注: 仅峰谷转换时刻 (周末全天谷时不标注) ----
-            if (!weekend)
+            // ---- 关键节点标注: 仅峰谷转换时刻 (非工作日全天谷时不标注) ----
+            if (!offDay)
             {
                 foreach (int hh in TransHours)
                 {
@@ -497,11 +520,15 @@ namespace DeepSeekTimeline
             g.DrawLine(PenPointer, xNow, BandTop - 3f, xNow, BandBottom + 3f);
             g.FillEllipse(BrDot, xNow - 3f, BandTop - 10f, 6f, 6f);
 
-            // ---- 价格行: 仅 Flash ----
-            string fl = string.Format(CultureInfo.InvariantCulture,
+            // ---- 价格行: Flash + Pro (字号略小于正文, 保证两模型一行放得下) ----
+            string fs = string.Format(CultureInfo.InvariantCulture,
                 "Flash 入 {0} · 缓存 {1} · 出 {2}",
-                Fmt(FlashIn(now)[idx]), Fmt(FlashHit(now)[idx]), Fmt(FlashOut(now)[idx]));
-            g.DrawString(fl, fontSub, BrSub, 20, 96);
+                Fmt(PriceFlashIn[idx]), Fmt(PriceFlashHit[idx]), Fmt(PriceFlashOut[idx]));
+            string ps = string.Format(CultureInfo.InvariantCulture,
+                "Pro 入 {0} · 缓存 {1} · 出 {2}",
+                Fmt(PriceProIn[idx]), Fmt(PriceProHit[idx]), Fmt(PriceProOut[idx]));
+            g.DrawString(fs, fontPrice, BrSub, 20, 96);
+            g.DrawString(ps, fontPrice, BrSub, 20 + Wd(g, fs, fontPrice) + 18, 96);
 
             // ---- 关闭按钮 ----
             Pen cp = hoverClose ? PenCloseHot : PenCloseDim;
