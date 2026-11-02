@@ -154,6 +154,10 @@ namespace DeepSeekTimeline
             fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
             fontPrice = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular);
 
+            // 程序图标取自 exe 内嵌资源; ExtractAssociatedIcon 不接受 UNC 路径,
+            // 从网络共享或 WSL 互操作路径运行时跳过, 使用系统默认图标
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch (ArgumentException) { }
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             TopMost = true;

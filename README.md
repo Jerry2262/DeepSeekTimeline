@@ -24,6 +24,8 @@
 2. 双击 [build.bat](<build.bat>) 编译。
 3. 运行生成的 `DeepSeekTimeline.exe`。
 
+程序与窗口使用内嵌的多尺寸图标，无需额外携带图标文件。图标源文件为 [app.svg](<app.svg>)，编译使用 [app.ico](<app.ico>)。
+
 当前仓库尚未提供预编译 Release。编译后的程序可以单独复制使用，无需安装。
 
 **操作：**按住窗口拖动；拖到屏幕顶部吸附，展开后向下拖动可脱离吸附；点击右上角 × 退出。窗口位置保存在 `%APPDATA%\DeepSeekTimeline.ini`。
