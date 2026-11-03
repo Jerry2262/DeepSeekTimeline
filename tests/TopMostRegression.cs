@@ -23,11 +23,28 @@ static class TopMostRegression
         protected override bool ShowWithoutActivation { get { return true; } }
         protected override void OnFormClosing(FormClosingEventArgs e) { }
         public void Recreate() { RecreateHandle(); }
+        public Bitmap Snapshot()
+        {
+            var bitmap = new Bitmap(ClientSize.Width, ClientSize.Height);
+            using (Graphics g = Graphics.FromImage(bitmap))
+                base.OnPaint(new PaintEventArgs(g, new Rectangle(Point.Empty, ClientSize)));
+            return bitmap;
+        }
     }
 
     static void SetField(object form, string name, object value)
     {
         typeof(TimelineForm).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic).SetValue(form, value);
+    }
+
+    static object Field(object form, string name)
+    {
+        return typeof(TimelineForm).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic).GetValue(form);
+    }
+
+    static bool Hidden(Probe form)
+    {
+        return (bool)typeof(TimelineForm).GetMethod("ContentHidden", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(form, null);
     }
 
     static void Check(bool ok, string label)
@@ -56,12 +73,61 @@ static class TopMostRegression
     }
 
     [STAThread]
-    static int Main()
+    static int Main(string[] args)
     {
         NativeMethods.SetProcessDPIAware();
         Application.EnableVisualStyles();
         using (Probe form = new Probe())
         {
+            // Exercise a truly invisible content area, including negative monitor origins.
+            Rectangle top = Screen.PrimaryScreen.Bounds;
+            foreach (Screen screen in Screen.AllScreens)
+                if (screen.Bounds.Top < top.Top) top = screen.Bounds;
+            SetField(form, "monRect", top);
+            SetField(form, "docked", true);
+            SetField(form, "expanded", false);
+            form.Location = new Point(top.Left + 20, top.Top - form.Height + 5);
+            foreach (string name in new[] { "fontBig", "fontSub", "fontTick", "fontPrice" })
+                Check(Field(form, name) == null, "cold hidden font deferred: " + name);
+            Check(Hidden(form), "content outside all monitors can skip text rendering");
+            using (Bitmap hidden = form.Snapshot())
+            {
+                Check(Field(form, "fontBig") == null, "hidden paint does not initialize fonts");
+                if (args.Length > 0 && args[0] == "--close-hidden")
+                {
+                    form.Show();
+                    Application.DoEvents();
+                    form.Close();
+                    Check(Field(form, "fontBig") == null, "never-expanded close keeps fonts uninitialized");
+                    Console.WriteLine("Failures: " + failures);
+                    return failures == 0 ? 0 : 1;
+                }
+                SetField(form, "expanded", true);
+                form.Top = top.Top;
+                using (Bitmap full = form.Snapshot())
+                {
+                    foreach (string name in new[] { "fontBig", "fontSub", "fontTick", "fontPrice" })
+                        Check(Field(form, name) != null, "first expanded paint initializes font: " + name);
+                    bool same = true;
+                    for (int y = form.Height - 5; y < form.Height; y++)
+                        for (int x = 0; x < form.Width; x++)
+                            if (hidden.GetPixel(x, y) != full.GetPixel(x, y)) same = false;
+                    Check(same, "visible 5px strip matches complete rendering pixel-for-pixel");
+                }
+                object font = Field(form, "fontBig");
+                using (Bitmap again = form.Snapshot())
+                    Check(object.ReferenceEquals(font, Field(form, "fontBig")), "expanded repaints reuse font instances");
+            }
+            // Real screen geometry guard: content touching another display is not hidden.
+            foreach (Screen screen in Screen.AllScreens)
+            {
+                Rectangle bounds = screen.Bounds;
+                SetField(form, "monRect", new Rectangle(bounds.Left, bounds.Top + 100, bounds.Width, bounds.Height));
+                SetField(form, "expanded", false);
+                form.Location = new Point(bounds.Left + 20, bounds.Top - 17);
+                Check(!Hidden(form), "visible content on another monitor is not skipped: " + bounds.Top);
+            }
+            Check(((Timer)Field(form, "dockTimer")).Interval == 100, "idle dock detection starts at 100ms");
             SetField(form, "docked", false);
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
             // Keep the probe out of the way; it never writes the user's ini file.
@@ -139,6 +205,10 @@ static class TopMostRegression
             foreground = GetForegroundWindow();
             DockTick(form);
             Check(form.Top < before, "dock retract animation moves upward");
+            Check(((Timer)Field(form, "dockTimer")).Interval == 30, "retract animation uses 30ms frames");
+            for (int i = 0; i < 30; i++) DockTick(form);
+            Check(form.Top == monitor.Top - form.Height + 5, "retract reaches exact hidden position");
+            Check(((Timer)Field(form, "dockTimer")).Interval == 100, "retracted window returns to 100ms detection");
             CheckTop(form, "dock retract animation");
             Check(GetForegroundWindow() == foreground, "dock retract does not steal focus");
 
@@ -150,8 +220,28 @@ static class TopMostRegression
             before = form.Top;
             DockTick(form);
             Check(form.Top > before, "dock expand animation moves downward");
+            Check(((Timer)Field(form, "dockTimer")).Interval == 30, "expand animation uses 30ms frames");
+            for (int i = 0; i < 30; i++) DockTick(form);
+            Check(form.Top == monitor.Top, "expand reaches exact monitor top");
+            Check(((Timer)Field(form, "dockTimer")).Interval == 100, "expanded stationary window uses 100ms detection");
             CheckTop(form, "dock expand animation");
             Check(GetForegroundWindow() == foreground, "dock expand does not steal focus");
+
+            // A saved retracted position must return to the screen it was docked to, also when
+            // the retracted window rect spans two vertically adjacent monitors.
+            foreach (Screen screen in Screen.AllScreens)
+            {
+                Rectangle bounds = screen.Bounds;
+                Probe saved = new Probe();
+                SetField(saved, "docked", true);
+                saved.Location = new Point(bounds.Left + 10, bounds.Top - saved.Height + 5);
+                IntPtr savedHandle = saved.Handle;
+                typeof(TimelineForm).GetMethod("OnLoad", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .Invoke(saved, new object[] { EventArgs.Empty });
+                Check(saved.Top == bounds.Top - saved.Height + 5,
+                    "saved retracted position stays on its own screen: top=" + bounds.Top);
+                GC.KeepAlive(savedHandle);
+            }
             SetField(form, "docked", false);
         }
         Console.WriteLine("Failures: " + failures);

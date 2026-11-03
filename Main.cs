@@ -94,6 +94,7 @@ namespace DeepSeekTimeline
         const int WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
         const int WM_WINDOWPOSCHANGED = 0x47, WM_STYLECHANGED = 0x7D;
         const int GWL_EXSTYLE = -20, WS_EX_TOPMOST = 0x00000008;
+        const int DockIdleInterval = 100, DockAnimationInterval = 30;
         const int Peek = 5; // 吸附隐藏时顶部保留的提示条高度(px)
 
         // 淡色系
@@ -109,7 +110,7 @@ namespace DeepSeekTimeline
         static readonly Color Pointer   = Color.FromArgb(40, 40, 46);
 
         readonly bool[] peakHour = new bool[24];
-        readonly Font fontBig, fontSub, fontTick, fontPrice;
+        Font fontBig, fontSub, fontTick, fontPrice;
         readonly Timer timer, dockTimer;
         readonly Rectangle closeRect = new Rectangle(W - 24, 8, 14, 14);
         bool hoverClose, docked, expanded, dragging;
@@ -149,11 +150,6 @@ namespace DeepSeekTimeline
             foreach (int[] r in PeakRanges)
                 for (int h = r[0]; h < r[1]; h++) peakHour[h] = true;
 
-            fontBig  = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
-            fontSub  = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
-            fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
-            fontPrice = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular);
-
             // 程序图标取自 exe 内嵌资源; ExtractAssociatedIcon 不接受 UNC 路径,
             // 从网络共享或 WSL 互操作路径运行时跳过, 使用系统默认图标
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
@@ -176,16 +172,26 @@ namespace DeepSeekTimeline
             {
                 SyncTimerToMinute();
                 // 完全收起时可见区只有 5px 静态边条, 跳过无效重绘
-                if (docked && !expanded && Top <= monRect.Top - H + Peek) return;
+                if (ContentHidden()) return;
                 Invalidate();
             };
             SyncTimerToMinute();
             timer.Start();
 
             dockTimer = new Timer();
-            dockTimer.Interval = 30;
+            dockTimer.Interval = DockIdleInterval;
             dockTimer.Tick += delegate { DockTick(); };
-            // 仅吸附状态才需要轮询鼠标, 未吸附时保持停止 (见 WndProc/OnLoad)
+            // 静止时每 100ms 检测鼠标；动画仍为 30ms；未吸附时停表。
+        }
+
+        // 收起时不使用文本字体；首次实际展示内容时再创建并持续复用。
+        void EnsureFonts()
+        {
+            if (fontBig != null) return;
+            fontBig  = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
+            fontSub  = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
+            fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
+            fontPrice = new Font("Microsoft YaHei UI", 8f, FontStyle.Regular);
         }
 
         // 不出现在 Alt-Tab；保留正常的置顶窗口激活行为
@@ -202,7 +208,11 @@ namespace DeepSeekTimeline
         protected override void OnLoad(EventArgs e)
         {
             base.OnLoad(e);
-            monRect = Screen.FromControl(this).Bounds;
+            // 吸附归属按提示条所在点判定: 收起时该点正好是吸附屏的顶边, 展开时在屏内;
+            // 收起态窗口矩形跨相邻屏时不会误判到另一块屏。
+            monRect = (docked
+                ? Screen.FromPoint(new Point(Left + W / 2, Top + H - Peek))
+                : Screen.FromControl(this)).Bounds;
             if (docked)
             {
                 Location = new Point(Location.X, monRect.Top - H + Peek);
@@ -277,7 +287,7 @@ namespace DeepSeekTimeline
                 {
                     if (x < vs.Left) x = vs.Left;
                     if (x > vs.Right - W) x = vs.Right - W;
-                    Location = new Point(x, 0); // Y 由 OnLoad 按吸附位修正
+                    Location = new Point(x, y); // 保留屏幕归属，OnLoad 再对齐该屏幕的顶部
                     return true;
                 }
                 if (x < vs.Left - 60 || x > vs.Right - 60 || y < vs.Top - 30 || y > vs.Bottom - 30)
@@ -395,13 +405,23 @@ namespace DeepSeekTimeline
             foreach (IDisposable d in new IDisposable[] { timer, dockTimer,
                 fontBig, fontSub, fontTick, fontPrice, BrPeak, BrOff, BrDim, BrMain, BrSub,
                 BrFaint, BrAccent, BrAccentOff, BrDot, PenPointer, PenBorder,
-                PenCloseDim, PenCloseHot, BandPath }) d.Dispose();
+                PenCloseDim, PenCloseHot, BandPath }) if (d != null) d.Dispose();
             base.OnFormClosed(e);
         }
 
         static float Wd(Graphics g, string s, Font f)
         {
             return g.MeasureString(s, f).Width;
+        }
+
+        bool ContentHidden()
+        {
+            if (!docked || expanded || Top > monRect.Top - H + Peek) return false;
+            // 上方可能还有显示器；内容真正不在任何屏幕上时才能跳过绘制。
+            Rectangle content = new Rectangle(Left, Top, W, H - Peek);
+            foreach (Screen screen in Screen.AllScreens)
+                if (screen.Bounds.IntersectsWith(content)) return false;
+            return true;
         }
 
         // 吸附模式核心: 鼠标感应 + 缓出滑动动画
@@ -424,7 +444,7 @@ namespace DeepSeekTimeline
             }
             else if (expanded)
             {
-                expanded = false; // 鼠标离开立即收起, 与展开同样零延迟
+                expanded = false; // 检测到鼠标离开后开始收起动画
             }
             int target = expanded ? monRect.Top : monRect.Top - H + Peek;
             if (Top != target)
@@ -435,6 +455,8 @@ namespace DeepSeekTimeline
                 NativeMethods.SetWindowPos(Handle, IntPtr.Zero, Left, Top + step, 0, 0,
                     0x0001 | 0x0004 | 0x0010); // NOSIZE | NOZORDER | NOACTIVATE
             }
+            int interval = Top == target ? DockIdleInterval : DockAnimationInterval;
+            if (dockTimer.Interval != interval) dockTimer.Interval = interval;
         }
 
         // 前台程序全屏(视频/游戏)时不弹出, 防干扰
@@ -468,8 +490,15 @@ namespace DeepSeekTimeline
         {
             Graphics g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.AntiAlias;
             g.Clear(Bg);
+            // 完全收起时只有底部 5px 可见；无需排版或绘制屏幕外的内容。
+            if (ContentHidden())
+            {
+                g.DrawRectangle(PenBorder, 0.5f, 0.5f, W - 1f, H - 1f);
+                return;
+            }
+            EnsureFonts();
+            g.TextRenderingHint = TextRenderingHint.AntiAlias;
 
             DateTime now = DateTime.Now;
             bool peak = IsPeak(now);
